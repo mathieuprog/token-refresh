@@ -2,6 +2,17 @@ import { AxiosError, AxiosInstance, AxiosResponse, CanceledError } from 'axios';
 import type { InternalAxiosRequestConfig } from 'axios';
 import type { AuthTokens } from './types/auth';
 
+declare module 'axios' {
+  // allows: axios.post(url, data, { skipAuthRefresh: true })
+  interface AxiosRequestConfig {
+    skipAuthRefresh?: boolean;
+  }
+  // used internally by interceptors
+  interface InternalAxiosRequestConfig {
+    skipAuthRefresh?: boolean;
+  }
+}
+
 interface RefreshTokenApi {
   /**
    * IMPORTANT: Use a separate client or set `skipAuthRefresh: true` on the refresh request
@@ -34,12 +45,6 @@ interface QueuedRequest {
   resolve: (response: AxiosResponse) => void;
   reject: (error: unknown) => void;
   config: InternalAxiosRequestConfig;
-}
-
-declare module 'axios' {
-  export interface InternalAxiosRequestConfig {
-    skipAuthRefresh?: boolean;
-  }
 }
 
 // Mutate-in-place header setter
