@@ -1,6 +1,6 @@
 {
   "name": "token-refresh",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A library for refreshing expired access tokens",
   "funding": "https://github.com/mathieuprog/token-refresh?sponsor=1",
   "type": "module",

@@ -10,35 +10,41 @@ declare module 'axios' {
   // used internally by interceptors
   interface InternalAxiosRequestConfig {
     skipAuthRefresh?: boolean;
+    _authRefreshRetried?: boolean; // prevent infinite refresh loops per request
   }
 }
 
-interface RefreshTokenApi {
-  /**
-   * IMPORTANT: Use a separate client or set `skipAuthRefresh: true` on the refresh request
-   * to avoid interceptor loops.
-   */
-  refreshTokens: (refreshToken: string) => Promise<AuthTokens>;
-  logout?: () => Promise<void>;
+// Custom error for timeout (nice for analytics)
+export class RefreshTimeoutError extends Error {
+  constructor() {
+    super('Refresh timeout');
+    this.name = 'RefreshTimeoutError';
+  }
 }
 
-interface TokenStorage {
+export interface AuthRefreshOptions {
+  refresh: (refreshToken: string) => Promise<AuthTokens>;
   getTokens: () => Promise<AuthTokens | null>;
   setTokens: (tokens: AuthTokens) => Promise<void>;
-}
-
-interface RefresherOptions {
-  onTokenExpired?: () => void;
-  onRefreshFailed?: () => void;
+  shouldRefresh: (context: {
+    status: number;
+    config: InternalAxiosRequestConfig;
+    error: AxiosError;
+  }) => boolean;
+  header?: {
+    name?: string;
+    format?: (token: string) => string;
+  };
+  onBeforeRefresh?: () => void;
+  onRefreshed?: (tokens: AuthTokens) => void;
+  onRefreshFailed?: (error: unknown) => void;
   maxRetries?: number;
-  isTokenExpired?: (error: AxiosError) => boolean;
+  refreshTimeout?: number;
   logger?: {
     debug: (message: string) => void;
     error: (message: string, error?: unknown) => void;
   };
-  refreshTimeout?: number; // ms
-  authHeaderName?: string; // default: 'Authorization'
-  buildAuthHeaderValue?: (t: string) => string; // default: (t) => `Bearer ${t}`
+  logout?: () => Promise<void>;
 }
 
 interface QueuedRequest {
@@ -55,47 +61,65 @@ function setAuthHeader(headers: any, name: string, value: string) {
   return headers;
 }
 
-// Timeout helper (no Promise.race footguns)
+// Timeout helper with custom error
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error('Refresh timeout')), ms);
+    const t = setTimeout(() => reject(new RefreshTimeoutError()), ms);
     p.then(
-      v => { clearTimeout(t); resolve(v); },
-      e => { clearTimeout(t); reject(e); }
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
     );
   });
 }
 
-export function createAuthTokenRefresher(
-  refreshApi: RefreshTokenApi,
-  tokenStorage: TokenStorage,
-  options: RefresherOptions = {}
-) {
+// Logger defaults quiet in production (library-friendly)
+const defaultLogger = {
+  debug: () => {}, // no-op by default
+  error: () => {}, // no-op by default
+};
+
+export function installAuthRefresh(
+  api: AxiosInstance,
+  options: AuthRefreshOptions
+): { uninstall: () => void } {
   let refreshInFlight: Promise<AuthTokens> | null = null;
   let refreshSubscribers: QueuedRequest[] = [];
   let refreshAttemptCount = 0;
 
   const {
-    onTokenExpired: onTokenExpiredCallback,
-    onRefreshFailed: onRefreshFailedCallback,
+    refresh,
+    getTokens,
+    setTokens,
+    shouldRefresh,
+    header = {},
+    onBeforeRefresh,
+    onRefreshed,
+    onRefreshFailed,
     maxRetries = 3,
-    isTokenExpired = defaultIsTokenExpired,
-    logger = defaultLogger,
     refreshTimeout = 10000,
-    authHeaderName = 'Authorization',
-    buildAuthHeaderValue = (t: string) => `Bearer ${t}`,
+    logger = defaultLogger,
+    logout,
   } = options;
 
-  const drainSuccess = (newToken: string, apiInstance: AxiosInstance) => {
-    const headerValue = buildAuthHeaderValue(newToken);
+  const headerName = header.name || 'Authorization';
+  const headerFormat = header.format || ((t: string) => `Bearer ${t}`);
+
+  const drainSuccess = (newToken: string) => {
+    const headerValue = headerFormat(newToken);
     refreshSubscribers.forEach(({ resolve, reject, config }) => {
       if (config.signal?.aborted) {
         reject(new CanceledError('canceled'));
         return;
       }
-      config.headers = setAuthHeader(config.headers, authHeaderName, headerValue);
+      config.headers = setAuthHeader(config.headers, headerName, headerValue);
       logger.debug(`Executing queued request ${config.url ?? ''} with refreshed token`);
-      apiInstance.request(config).then(resolve).catch(reject);
+      api.request(config).then(resolve).catch(reject);
     });
     refreshSubscribers = [];
   };
@@ -117,9 +141,11 @@ export function createAuthTokenRefresher(
     refreshAttemptCount++;
     logger.debug(`Refresh attempt #${refreshAttemptCount} in progress`);
 
+    onBeforeRefresh?.();
+
     const promise = (async () => {
       try {
-        return await withTimeout(refreshApi.refreshTokens(refreshToken), refreshTimeout);
+        return await withTimeout(refresh(refreshToken), refreshTimeout);
       } finally {
         refreshInFlight = null;
       }
@@ -129,118 +155,113 @@ export function createAuthTokenRefresher(
     return promise;
   };
 
-  return function setupAuthTokenRefresher(apiInstance: AxiosInstance) {
-    const terminalAuthLost = async (reason: string, originalError: unknown): Promise<never> => {
-      logger.debug(`Auth lost: ${reason}`);
+  const terminalAuthLost = async (reason: string, originalError: unknown): Promise<never> => {
+    logger.debug(`Auth lost: ${reason}`);
+    refreshAttemptCount = 0;
+    drainFailure(originalError);
+    onRefreshFailed?.(originalError);
+    setAuthHeaders(api, null, headerName, headerFormat);
+    await logout?.().catch(() => {});
+    throw originalError;
+  };
+
+  const interceptorId = api.interceptors.response.use(
+    (response) => {
       refreshAttemptCount = 0;
-      drainFailure(originalError);
-      onRefreshFailedCallback?.();
-      onTokenExpiredCallback?.();
-      setAuthHeaders(apiInstance, null, authHeaderName, buildAuthHeaderValue);
-      await refreshApi.logout?.().catch(() => {});
-      throw originalError;
-    };
+      return response;
+    },
+    async (error: AxiosError) => {
+      const { config } = error as AxiosError & { config: InternalAxiosRequestConfig | undefined };
 
-    const interceptorId = apiInstance.interceptors.response.use(
-      (response) => {
+      if (!config) {
         refreshAttemptCount = 0;
-        return response;
-      },
-      async (error: AxiosError) => {
-        const { config } = error as AxiosError & { config: InternalAxiosRequestConfig | undefined };
+        throw error;
+      }
 
-        if (!config || !isTokenExpired(error)) {
-          refreshAttemptCount = 0;
-          throw error;
-        }
+      const status = error.response?.status ?? 0;
+      if (!shouldRefresh({ status, config, error })) {
+        refreshAttemptCount = 0;
+        throw error;
+      }
 
-        if (config.skipAuthRefresh) {
-          throw error;
-        }
+      // Prevent infinite refresh loops per request (belt-and-suspenders)
+      if (config._authRefreshRetried) {
+        // We've already refreshed for this request once; don't do it again
+        throw error;
+      }
+      config._authRefreshRetried = true;
 
-        logger.debug(`Access token expired for URL: ${config.url ?? ''}`);
+      logger.debug(`Access token expired for URL: ${config.url ?? ''}`);
 
-        // Get stored tokens
-        let storedTokens: AuthTokens | null = null;
-        try {
-          storedTokens = await tokenStorage.getTokens();
-        } catch (err) {
-          logger.error('Failed to get tokens from storage:', err);
-        }
+      // Get stored tokens
+      let storedTokens: AuthTokens | null = null;
+      try {
+        storedTokens = await getTokens();
+      } catch (err) {
+        logger.error('Failed to get tokens from storage:', err);
+      }
 
-        if (!storedTokens?.refreshToken) {
-          await terminalAuthLost('no-refresh-token', error);
-        }
+      if (!storedTokens?.refreshToken) {
+        await terminalAuthLost('no-refresh-token', error);
+      }
 
-        // Queue this failed request while we refresh
-        const promise = queue(config);
+      // Queue this failed request while we refresh
+      const promise = queue(config);
 
-        if (refreshInFlight) {
-          logger.debug(`Refresh already in flight; returning queued promise for ${config.url ?? ''}`);
-          return promise;
-        }
-
-        if (refreshAttemptCount >= maxRetries) {
-          await terminalAuthLost('max-retries', error);
-        }
-
-        try {
-          const refreshed = await getOrStartRefresh(storedTokens!.refreshToken);
-
-          const newAccessToken = refreshed.accessToken;
-          if (!newAccessToken) throw new Error('Invalid refresh response - no access token');
-
-          logger.debug(`Received new access token`);
-          setAuthHeaders(apiInstance, newAccessToken, authHeaderName, buildAuthHeaderValue);
-
-          try {
-            // Merge to avoid dropping existing refreshToken if server omits it
-            const updatedTokens = { ...storedTokens, ...refreshed };
-            await tokenStorage.setTokens(updatedTokens);
-          } catch (err) {
-            logger.error('Failed to store new tokens:', err);
-          }
-
-          refreshAttemptCount = 0;
-          drainSuccess(newAccessToken, apiInstance);
-        } catch (e) {
-          logger.error('Auth token refresher error:', e);
-          if ((e as any)?.response?.status === 401) {
-            await terminalAuthLost('refresh-401', e);
-          }
-          drainFailure(e);
-          onRefreshFailedCallback?.();
-          throw e;
-        }
-
+      if (refreshInFlight) {
+        logger.debug(`Refresh already in flight; returning queued promise for ${config.url ?? ''}`);
         return promise;
       }
-    );
 
-    return {
-      eject: () => {
-        apiInstance.interceptors.response.eject(interceptorId);
-        if (refreshSubscribers.length) {
-          drainFailure(new CanceledError('auth refresher ejected'));
-        }
+      if (refreshAttemptCount >= maxRetries) {
+        await terminalAuthLost('max-retries', error);
       }
-    };
+
+      try {
+        const refreshed = await getOrStartRefresh(storedTokens!.refreshToken);
+
+        const newAccessToken = refreshed.accessToken;
+        if (!newAccessToken) throw new Error('Invalid refresh response - no access token');
+
+        logger.debug(`Received new access token`);
+        setAuthHeaders(api, newAccessToken, headerName, headerFormat);
+
+        try {
+          // Merge to avoid dropping existing refreshToken if server omits it
+          const updatedTokens = { ...storedTokens, ...refreshed };
+          await setTokens(updatedTokens);
+          onRefreshed?.(updatedTokens);
+        } catch (err) {
+          logger.error('Failed to store new tokens:', err);
+        }
+
+        refreshAttemptCount = 0;
+        drainSuccess(newAccessToken);
+      } catch (e) {
+        logger.error('Auth token refresher error:', e);
+        if ((e as any)?.response?.status === 401) {
+          await terminalAuthLost('refresh-401', e);
+        }
+        drainFailure(e);
+        onRefreshFailed?.(e);
+        throw e;
+      }
+
+      return promise;
+    }
+  );
+
+  return {
+    uninstall: () => {
+      api.interceptors.response.eject(interceptorId);
+      if (refreshSubscribers.length) {
+        drainFailure(new CanceledError('auth refresher uninstalled'));
+      }
+      // nullify in-flight refresh for cleaner state
+      refreshInFlight = null;
+    },
   };
 }
-
-// 401 matcher (customize via options.isTokenExpired)
-function defaultIsTokenExpired(error: AxiosError): boolean {
-  const status = error.response?.status;
-  if (status !== 401) return false;
-  const authHeader = error.response?.headers?.['www-authenticate'];
-  if (typeof authHeader === 'string' && /expired|invalid_token/i.test(authHeader)) return true;
-  return (error.response?.data as any)?.message === 'Expired JWT Token';
-}
-
-const defaultLogger = {
-  debug: (message: string) => console.log(message),
-  error: (message: string, error?: unknown) => console.error(message, error),
-};
 
 export function setAuthHeaders(
   apiInstance: AxiosInstance,
