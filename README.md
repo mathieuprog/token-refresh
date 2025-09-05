@@ -139,8 +139,9 @@ installAuthRefresh(api, {
 
 ## How It Works
 
-When a request fails with a condition that matches `shouldRefresh` (default: 401 status + no `skipAuthRefresh` flag), the library:
+When a request fails with a condition that matches your `shouldRefresh` function, the library:
 
+0. **Stale-token fast path:** If the 401 came from a request that was sent with an older token than the library currently holds in memory (e.g., you fixed the header or a previous refresh already updated it), the request is retried **once** with the current token — **no refresh call** is made.
 1. **Loop prevention**: Checks if this specific request already attempted a refresh
 2. **Single-flight refresh**: Only one refresh happens at a time, even with concurrent 401s
 3. **Request queuing**: Failed requests are queued while refresh is in progress  
@@ -165,7 +166,7 @@ interface AuthRefreshOptions {
   refresh: (refreshToken: string) => Promise<AuthTokens>;
   getTokens: () => Promise<AuthTokens | null>;
   setTokens: (tokens: AuthTokens) => Promise<void>;
-  shouldRefresh?: (context: { status: number; config: InternalAxiosRequestConfig; error: AxiosError }) => boolean;
+  shouldRefresh: (context: { status: number; config: InternalAxiosRequestConfig; error: AxiosError }) => boolean;
   header?: {
     name?: string;           // default: 'Authorization'
     format?: (token: string) => string; // default: (t) => `Bearer ${t}`
@@ -178,6 +179,11 @@ interface AuthRefreshOptions {
   logger?: { debug(msg), error(msg, err?) }; // default: no-op (quiet)
   logout?: () => Promise<void>;
 }
+```
+
+Note: `shouldRefresh` is required. A common implementation is:
+```ts
+shouldRefresh: ({ status, config }) => status === 401 && !config.skipAuthRefresh
 ```
 
 ### RefreshTimeoutError
