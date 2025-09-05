@@ -11,10 +11,12 @@ declare module 'axios' {
   interface InternalAxiosRequestConfig {
     skipAuthRefresh?: boolean;
     _authRefreshRetried?: boolean; // prevent infinite refresh loops per request
+    _authTriedCurrent?: boolean;   // retried once with current token on stale-token 401
+    _sentAccessToken?: string;     // token value that went out with this request
   }
 }
 
-// Custom error for timeout (nice for analytics)
+// Custom error for timeout (handy for analytics/telemetry)
 export class RefreshTimeoutError extends Error {
   constructor() {
     super('Refresh timeout');
@@ -53,12 +55,20 @@ interface QueuedRequest {
   config: InternalAxiosRequestConfig;
 }
 
-// Mutate-in-place header setter
+// Mutate-in-place header setter for a config.headers bag
 function setAuthHeader(headers: any, name: string, value: string) {
   if (!headers) return { [name]: value };
   if (typeof headers.set === 'function') headers.set(name, value);
   else headers[name] = value;
   return headers;
+}
+
+// Read a header value from a possibly mixed header bag (Map-like or plain object)
+function readHeader(headers: any, name: string): string | undefined {
+  if (!headers) return undefined;
+  if (typeof headers.get === 'function') return headers.get(name);
+  const lower = typeof name === 'string' ? name.toLowerCase() : name;
+  return headers[name] ?? headers[lower];
 }
 
 // Timeout helper with custom error
@@ -78,10 +88,10 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-// Logger defaults quiet in production (library-friendly)
+// Quiet by default (library-friendly)
 const defaultLogger = {
-  debug: () => {}, // no-op by default
-  error: () => {}, // no-op by default
+  debug: () => {},
+  error: () => {},
 };
 
 export function installAuthRefresh(
@@ -102,13 +112,44 @@ export function installAuthRefresh(
     onRefreshed,
     onRefreshFailed,
     maxRetries = 3,
-    refreshTimeout = 10000,
+    refreshTimeout = 10_000,
     logger = defaultLogger,
     logout,
   } = options;
 
   const headerName = header.name || 'Authorization';
   const headerFormat = header.format || ((t: string) => `Bearer ${t}`);
+
+  // Source-of-truth for the latest access token observed by the interceptor
+  let currentAccessToken: string | null = null;
+  void getTokens()
+    .then((t) => {
+      currentAccessToken = t?.accessToken ?? null;
+    })
+    .catch(() => {});
+
+  // Stamp outgoing requests with the latest token & remember which token was sent.
+  // - Respects cfg.skipAuthRefresh (no header, no stamp)
+  // - Respects an explicit per-request header (won’t overwrite)
+  // - If explicit header equals headerFormat(currentAccessToken), we still stamp _sentAccessToken
+  const reqInterceptorId = api.interceptors.request.use((cfg) => {
+    if (cfg.skipAuthRefresh) return cfg;
+
+    const explicit = readHeader(cfg.headers, headerName);
+    if (explicit != null) {
+      if (currentAccessToken && explicit === headerFormat(currentAccessToken)) {
+        cfg._sentAccessToken = currentAccessToken;
+      }
+      return cfg; // don't overwrite caller's header
+    }
+
+    if (currentAccessToken) {
+      cfg.headers = setAuthHeader(cfg.headers, headerName, headerFormat(currentAccessToken));
+      cfg._sentAccessToken = currentAccessToken;
+    }
+
+    return cfg;
+  });
 
   const drainSuccess = (newToken: string) => {
     const headerValue = headerFormat(newToken);
@@ -118,6 +159,7 @@ export function installAuthRefresh(
         return;
       }
       config.headers = setAuthHeader(config.headers, headerName, headerValue);
+      config._sentAccessToken = newToken; // so stale-token fast-path can reason correctly
       logger.debug(`Executing queued request ${config.url ?? ''} with refreshed token`);
       api.request(config).then(resolve).catch(reject);
     });
@@ -140,7 +182,6 @@ export function installAuthRefresh(
 
     refreshAttemptCount++;
     logger.debug(`Refresh attempt #${refreshAttemptCount} in progress`);
-
     onBeforeRefresh?.();
 
     const promise = (async () => {
@@ -158,6 +199,7 @@ export function installAuthRefresh(
   const terminalAuthLost = async (reason: string, originalError: unknown): Promise<never> => {
     logger.debug(`Auth lost: ${reason}`);
     refreshAttemptCount = 0;
+    currentAccessToken = null;
     drainFailure(originalError);
     onRefreshFailed?.(originalError);
     setAuthHeaders(api, null, headerName, headerFormat);
@@ -165,7 +207,7 @@ export function installAuthRefresh(
     throw originalError;
   };
 
-  const interceptorId = api.interceptors.response.use(
+  const respInterceptorId = api.interceptors.response.use(
     (response) => {
       refreshAttemptCount = 0;
       return response;
@@ -178,15 +220,36 @@ export function installAuthRefresh(
         throw error;
       }
 
+      // Honor skipAuthRefresh on responses, too (belt-and-suspenders)
+      if (config.skipAuthRefresh) {
+        refreshAttemptCount = 0;
+        throw error;
+      }
+
       const status = error.response?.status ?? 0;
+
+      // Fast-path: if the request 401'd with an older token than we now have, retry ONCE with the current token.
+      if (
+        status === 401 &&
+        config._sentAccessToken &&
+        currentAccessToken &&
+        config._sentAccessToken !== currentAccessToken &&
+        !config._authTriedCurrent
+      ) {
+        logger.debug(`401 with stale token; retrying ${config.url ?? ''} with current token`);
+        config._authTriedCurrent = true;
+        config.headers = setAuthHeader(config.headers, headerName, headerFormat(currentAccessToken));
+        config._sentAccessToken = currentAccessToken;
+        return api.request(config);
+      }
+
       if (!shouldRefresh({ status, config, error })) {
         refreshAttemptCount = 0;
         throw error;
       }
 
-      // Prevent infinite refresh loops per request (belt-and-suspenders)
+      // Prevent per-request refresh loops
       if (config._authRefreshRetried) {
-        // We've already refreshed for this request once; don't do it again
         throw error;
       }
       config._authRefreshRetried = true;
@@ -225,6 +288,7 @@ export function installAuthRefresh(
 
         logger.debug(`Received new access token`);
         setAuthHeaders(api, newAccessToken, headerName, headerFormat);
+        currentAccessToken = newAccessToken;
 
         try {
           // Merge to avoid dropping existing refreshToken if server omits it
@@ -253,16 +317,20 @@ export function installAuthRefresh(
 
   return {
     uninstall: () => {
-      api.interceptors.response.eject(interceptorId);
+      api.interceptors.request.eject(reqInterceptorId);
+      api.interceptors.response.eject(respInterceptorId);
       if (refreshSubscribers.length) {
         drainFailure(new CanceledError('auth refresher uninstalled'));
       }
-      // nullify in-flight refresh for cleaner state
       refreshInFlight = null;
     },
   };
 }
 
+/**
+ * Helper to sync an axios instance's default header with a token (or clear it).
+ * Uses HeaderBag#set/delete if available, otherwise falls back to plain object semantics.
+ */
 export function setAuthHeaders(
   apiInstance: AxiosInstance,
   token: string | null,
@@ -271,7 +339,6 @@ export function setAuthHeaders(
 ) {
   const headers: any = apiInstance.defaults.headers.common;
   if (typeof headers.set !== 'function' || typeof headers.delete !== 'function') {
-    // If someone polyfilled/overrode headers, fallback to object semantics
     if (token) (headers as any)[name] = build(token);
     else delete (headers as any)[name];
     return;
