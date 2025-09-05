@@ -228,20 +228,32 @@ export function installAuthRefresh(
 
       const status = error.response?.status ?? 0;
 
-      // Fast-path: if the request 401'd with an older token than we now have, retry ONCE with the current token.
+      // --- Stale-token fast-path -------------------------------------------
+      // If the request 401'd but was sent with an older token than we have now,
+      // retry ONCE with the current token instead of starting another refresh.
+      const sentHeaderValue = readHeader(config.headers, headerName);
+      const formattedCurrent = currentAccessToken ? headerFormat(currentAccessToken) : undefined;
+
       if (
         status === 401 &&
-        config._sentAccessToken &&
         currentAccessToken &&
-        config._sentAccessToken !== currentAccessToken &&
-        !config._authTriedCurrent
+        !config._authTriedCurrent &&
+        (
+          // Primary path: we stamped `_sentAccessToken` on the request and can compare directly
+          (config._sentAccessToken && config._sentAccessToken !== currentAccessToken) ||
+          // Fallback path: the request had an explicit auth header (or `_sentAccessToken` was lost)
+          // — e.g. caller manually set `Authorization`/`XAuthToken`, or another interceptor rewrote it.
+          // Compare the header that actually went out vs the *current* token to detect a stale-token 401.
+          (sentHeaderValue && formattedCurrent && sentHeaderValue !== formattedCurrent)
+        )
       ) {
         logger.debug(`401 with stale token; retrying ${config.url ?? ''} with current token`);
         config._authTriedCurrent = true;
-        config.headers = setAuthHeader(config.headers, headerName, headerFormat(currentAccessToken));
+        config.headers = setAuthHeader(config.headers, headerName, formattedCurrent!);
         config._sentAccessToken = currentAccessToken;
         return api.request(config);
       }
+      // ---------------------------------------------------------------------
 
       if (!shouldRefresh({ status, config, error })) {
         refreshAttemptCount = 0;
@@ -339,8 +351,15 @@ export function setAuthHeaders(
 ) {
   const headers: any = apiInstance.defaults.headers.common;
   if (typeof headers.set !== 'function' || typeof headers.delete !== 'function') {
-    if (token) (headers as any)[name] = build(token);
-    else delete (headers as any)[name];
+    // If defaults are a plain object, keep both shapes in sync (defensive).
+    const lower = typeof name === 'string' ? name.toLowerCase() : name;
+    if (token) {
+      (headers as any)[name] = build(token);
+      (headers as any)[lower] = (headers as any)[name];
+    } else {
+      delete (headers as any)[name];
+      delete (headers as any)[lower];
+    }
     return;
   }
   if (token) headers.set(name, build(token));
