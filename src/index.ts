@@ -5,4 +5,4 @@ export {
 } from './authTokenRefresher';
 
 export type { AuthTokens } from './types/auth';
-export type { AuthRefreshOptions } from './authTokenRefresher';
+export type { AuthRefreshOptions, RequestFailureContext } from './authTokenRefresher';

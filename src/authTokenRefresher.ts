@@ -24,15 +24,19 @@ export class RefreshTimeoutError extends Error {
   }
 }
 
+export interface RequestFailureContext {
+  status: number;           // HTTP status, or 0 if unavailable
+  data?: any;               // Response payload if available (e.g., Axios error response.data)
+  error: AxiosError;        // Axios error from the failed original request
+}
+
 export interface AuthRefreshOptions {
   refresh: (refreshToken: string) => Promise<AuthTokens>;
   getTokens: () => Promise<AuthTokens | null>;
   setTokens: (tokens: AuthTokens) => Promise<void>;
-  shouldRefresh: (context: {
-    status: number;
-    config: InternalAxiosRequestConfig;
-    error: AxiosError;
-  }) => boolean;
+  isSessionExpired: (context: RequestFailureContext) => boolean;
+  // Decide whether a refresh failure means the session is terminally lost
+  isRefreshFailureTerminal: (error: unknown) => boolean;
   header?: {
     name?: string;
     format?: (token: string) => string;
@@ -106,7 +110,8 @@ export function installAuthRefresh(
     refresh,
     getTokens,
     setTokens,
-    shouldRefresh,
+    isSessionExpired,
+    isRefreshFailureTerminal,
     header = {},
     onBeforeRefresh,
     onRefreshed,
@@ -227,15 +232,19 @@ export function installAuthRefresh(
       }
 
       const status = error.response?.status ?? 0;
+      const data = error.response?.data;
+      const isExpiredForRequest = isSessionExpired({ status, data, error });
 
       // --- Stale-token fast-path -------------------------------------------
-      // If the request 401'd but was sent with an older token than we have now,
-      // retry ONCE with the current token instead of starting another refresh.
+      // If the request failed due to an expired/invalid session (per isSessionExpired),
+      // but it was sent with an older token than we have now, retry ONCE with the
+      // current token instead of starting another refresh.
       const sentHeaderValue = readHeader(config.headers, headerName);
       const formattedCurrent = currentAccessToken ? headerFormat(currentAccessToken) : undefined;
 
       if (
-        status === 401 &&
+        // Only consider the fast path if the failure represents an expired session
+        isExpiredForRequest &&
         currentAccessToken &&
         !config._authTriedCurrent &&
         (
@@ -247,7 +256,7 @@ export function installAuthRefresh(
           (sentHeaderValue && formattedCurrent && sentHeaderValue !== formattedCurrent)
         )
       ) {
-        logger.debug(`401 with stale token; retrying ${config.url ?? ''} with current token`);
+        logger.debug(`Stale token detected; retrying ${config.url ?? ''} with current token`);
         config._authTriedCurrent = true;
         config.headers = setAuthHeader(config.headers, headerName, formattedCurrent!);
         config._sentAccessToken = currentAccessToken;
@@ -255,7 +264,7 @@ export function installAuthRefresh(
       }
       // ---------------------------------------------------------------------
 
-      if (!shouldRefresh({ status, config, error })) {
+      if (!isExpiredForRequest) {
         refreshAttemptCount = 0;
         throw error;
       }
@@ -315,9 +324,11 @@ export function installAuthRefresh(
         drainSuccess(newAccessToken);
       } catch (e) {
         logger.error('Auth token refresher error:', e);
-        if ((e as any)?.response?.status === 401) {
-          await terminalAuthLost('refresh-401', e);
+        if (isRefreshFailureTerminal(e)) {
+          // Terminal path: clears headers, drains, invokes logout, and throws.
+          return await terminalAuthLost('refresh-auth-lost', e);
         }
+        // Non-terminal refresh failure: reject queued requests and bubble up.
         drainFailure(e);
         onRefreshFailed?.(e);
         throw e;

@@ -35,7 +35,9 @@ const { uninstall } = installAuthRefresh(api, {
   },
   getTokens,
   setTokens,
-  shouldRefresh: ({ status, config }) => status === 401 && !config.skipAuthRefresh,
+  isSessionExpired: (ctx) => {
+    return ctx.status === 401;
+  },
   header: { 
     name: 'Authorization',        // default: 'Authorization'
     format: (t) => `Bearer ${t}`  // default: Bearer format
@@ -139,11 +141,11 @@ installAuthRefresh(api, {
 
 ## How It Works
 
-When a request fails with a condition that matches your `shouldRefresh` function, the library:
+When a request fails with a condition that your `isSessionExpired` function returns true for, the library:
 
-0. **Stale-token fast path:** If the 401 came from a request that was sent with an older token than the library currently holds in memory (e.g., you fixed the header or a previous refresh already updated it), the request is retried **once** with the current token — **no refresh call** is made.
+0. **Stale-token fast path:** If the response matches your `isSessionExpired` predicate and the request was sent with an older token than the library currently holds in memory (e.g., you fixed the header or a previous refresh already updated it), the request is retried **once** with the current token — **no refresh call** is made.
 1. **Loop prevention**: Checks if this specific request already attempted a refresh
-2. **Single-flight refresh**: Only one refresh happens at a time, even with concurrent 401s
+2. **Single-flight refresh**: Only one refresh happens at a time, even with concurrent failures
 3. **Request queuing**: Failed requests are queued while refresh is in progress  
 4. **Header updates**: Updates the default auth header on the Axios instance
 5. **Request retry**: Queued requests are retried with the new token
@@ -166,7 +168,8 @@ interface AuthRefreshOptions {
   refresh: (refreshToken: string) => Promise<AuthTokens>;
   getTokens: () => Promise<AuthTokens | null>;
   setTokens: (tokens: AuthTokens) => Promise<void>;
-  shouldRefresh: (context: { status: number; config: InternalAxiosRequestConfig; error: AxiosError }) => boolean;
+  isSessionExpired: (context: { status: number; data?: any; error: AxiosError }) => boolean;
+  isRefreshFailureTerminal: (error: unknown) => boolean;
   header?: {
     name?: string;           // default: 'Authorization'
     format?: (token: string) => string; // default: (t) => `Bearer ${t}`
@@ -181,9 +184,14 @@ interface AuthRefreshOptions {
 }
 ```
 
-Note: `shouldRefresh` is required. A common implementation is:
+Note: `isSessionExpired` is required. A common implementation is:
 ```ts
-shouldRefresh: ({ status, config }) => status === 401 && !config.skipAuthRefresh
+  isSessionExpired: (ctx) => ctx.status === 401,
+  isRefreshFailureTerminal: (error) => {
+    // Axios example:
+    const status = (error as any)?.response?.status ?? 0;
+    return status === 401;
+  }
 ```
 
 ### RefreshTimeoutError
@@ -196,20 +204,25 @@ Update or remove the instance's default auth header.
 
 ## Advanced Usage
 
-### Custom shouldRefresh Logic
+### Custom isSessionExpired / isRefreshFailureTerminal
 
 ```ts
 installAuthRefresh(api, {
   // ... other options
-  shouldRefresh: ({ status, config, error }) => {
-    // Custom logic for when to refresh
-    if (config.skipAuthRefresh) return false;
-    if (config._authRefreshRetried) return false; // already tried once
-    if (status === 401) return true;
-    
-    // Maybe also refresh on 403 with specific error codes
-    const errorCode = error.response?.data?.code;
-    return status === 403 && errorCode === 'TOKEN_EXPIRED';
+  // Decide when an original request failure should trigger a refresh
+  isSessionExpired: (ctx) => {
+    if (ctx.status === 401) return true;
+    const code = ctx.data?.code;
+    return ctx.status === 403 && code === 'TOKEN_EXPIRED';
+  },
+  // Decide when a refresh failure means auth is terminally lost
+  isRefreshFailureTerminal: (error) => {
+    // Axios example; adapt for your HTTP client
+    const status = (error as any)?.response?.status ?? 0;
+    const code = (error as any)?.response?.data?.code;
+    if (status === 401) return true; // typical: invalid/expired refresh token
+    return (status === 400 || status === 403 || status === 409) &&
+           ['INVALID_GRANT', 'INVALID_REFRESH_TOKEN', 'TOKEN_REVOKED', 'TOKEN_REUSE_DETECTED'].includes(code);
   }
 });
 ```
