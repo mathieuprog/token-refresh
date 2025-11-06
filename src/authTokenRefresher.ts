@@ -130,6 +130,11 @@ export function installAuthRefresh(
   void getTokens()
     .then((t) => {
       currentAccessToken = t?.accessToken ?? null;
+      try {
+        logger.debug(
+          `Auth refresher boot: initial tokens loaded (accessToken present: ${currentAccessToken ? 'yes' : 'no'})`
+        );
+      } catch {}
     })
     .catch(() => {});
 
@@ -157,6 +162,8 @@ export function installAuthRefresh(
   });
 
   const drainSuccess = (newToken: string) => {
+    const queued = refreshSubscribers.length;
+    if (queued) logger.debug(`Draining ${queued} queued request(s) with refreshed token`);
     const headerValue = headerFormat(newToken);
     refreshSubscribers.forEach(({ resolve, reject, config }) => {
       if (config.signal?.aborted) {
@@ -172,13 +179,18 @@ export function installAuthRefresh(
   };
 
   const drainFailure = (error: unknown) => {
+    const queued = refreshSubscribers.length;
+    if (queued) logger.debug(`Draining ${queued} queued request(s) with failure`);
     refreshSubscribers.forEach(({ reject }) => reject(error));
     refreshSubscribers = [];
   };
 
   const queue = (config: InternalAxiosRequestConfig) =>
     new Promise<AxiosResponse>((resolve, reject) => {
-      logger.debug(`Queueing request to ${config.url ?? ''} while awaiting token refresh`);
+      const size = refreshSubscribers.length + 1;
+      logger.debug(
+        `Queueing request to ${config.url ?? ''} while awaiting token refresh (queue size: ${size})`
+      );
       refreshSubscribers.push({ resolve, reject, config });
     });
 
@@ -234,6 +246,10 @@ export function installAuthRefresh(
       const status = error.response?.status ?? 0;
       const data = error.response?.data;
       const isExpiredForRequest = isSessionExpired({ status, data, error });
+      if (!isExpiredForRequest) {
+        refreshAttemptCount = 0;
+        throw error;
+      }
 
       // --- Stale-token fast-path -------------------------------------------
       // If the request failed due to an expired/invalid session (per isSessionExpired),
@@ -264,13 +280,9 @@ export function installAuthRefresh(
       }
       // ---------------------------------------------------------------------
 
-      if (!isExpiredForRequest) {
-        refreshAttemptCount = 0;
-        throw error;
-      }
-
       // Prevent per-request refresh loops
       if (config._authRefreshRetried) {
+        logger.debug(`Auth refresher: request already retried refresh for ${config.url ?? ''}`);
         throw error;
       }
       config._authRefreshRetried = true;
@@ -286,7 +298,10 @@ export function installAuthRefresh(
       }
 
       if (!storedTokens?.refreshToken) {
-        await terminalAuthLost('no-refresh-token', error);
+        logger.debug(
+          `Auth refresher: no refresh token available; marking auth lost for ${config.url ?? ''}`
+        );
+        return await terminalAuthLost('no-refresh-token', error);
       }
 
       // Queue this failed request while we refresh
@@ -298,7 +313,10 @@ export function installAuthRefresh(
       }
 
       if (refreshAttemptCount >= maxRetries) {
-        await terminalAuthLost('max-retries', error);
+        logger.error(
+          `Auth refresher: max retries reached (${refreshAttemptCount} >= ${maxRetries}); marking auth lost`
+        );
+        return await terminalAuthLost('max-retries', error);
       }
 
       try {
@@ -325,6 +343,7 @@ export function installAuthRefresh(
       } catch (e) {
         logger.error('Auth token refresher error:', e);
         if (isRefreshFailureTerminal(e)) {
+          logger.debug('Auth refresher: refresh failure classified as terminal; logging out');
           // Terminal path: clears headers, drains, invokes logout, and throws.
           return await terminalAuthLost('refresh-auth-lost', e);
         }
@@ -342,9 +361,13 @@ export function installAuthRefresh(
     uninstall: () => {
       api.interceptors.request.eject(reqInterceptorId);
       api.interceptors.response.eject(respInterceptorId);
-      if (refreshSubscribers.length) {
+      const queued = refreshSubscribers.length;
+      if (queued) {
         drainFailure(new CanceledError('auth refresher uninstalled'));
       }
+      logger.debug(
+        `Auth refresher: interceptors ejected; drained ${queued} queued request(s)`
+      );
       refreshInFlight = null;
     },
   };
