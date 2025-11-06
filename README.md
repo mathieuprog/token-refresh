@@ -38,6 +38,10 @@ const { uninstall } = installAuthRefresh(api, {
   isSessionExpired: (ctx) => {
     return ctx.status === 401;
   },
+  isRefreshFailureTerminal: (error) => {
+    const status = (error as any)?.response?.status ?? 0;
+    return status === 401;
+  },
   header: { 
     name: 'Authorization',        // default: 'Authorization'
     format: (t) => `Bearer ${t}`  // default: Bearer format
@@ -68,11 +72,10 @@ const { uninstall } = installAuthRefresh(api, {
   }
 });
 
-// Optional: seed the default header on app boot
+// Recommended: seed the default header before making requests
+// This avoids a cold-start race where the first request might leave without a header.
 const existing = await getTokens();
-if (existing?.accessToken) {
-  setAuthHeaders(api, existing.accessToken);
-}
+if (existing?.accessToken) setAuthHeaders(api, existing.accessToken);
 
 // Clean up when needed (tests, hot reloads, etc.)
 // uninstall();
